@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v3
+
+    - name: Set up Python
+      run: uv python install 3.12
+
+    - name: Install dependencies
+      run: uv sync --all-extras --dev
+
+    - name: Configure Git
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Determine version bump
+      id: version_bump
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "bump_type=${{ github.event.inputs.version_bump }}" >> $GITHUB_OUTPUT
+        else
+          # Auto-determine from commit messages
+          if git log -1 --pretty=%B | grep -qE "^(BREAKING CHANGE|feat!|fix!)"; then
+            echo "bump_type=major" >> $GITHUB_OUTPUT
+          elif git log -1 --pretty=%B | grep -qE "^feat"; then
+            echo "bump_type=minor" >> $GITHUB_OUTPUT
+          else
+            echo "bump_type=patch" >> $GITHUB_OUTPUT
+          fi
+        fi
+
+    - name: Bump version
+      id: bump_version
+      run: |
+        CURRENT_VERSION=$(grep "^version = " pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+        echo "Current version: $CURRENT_VERSION"
+
+        IFS='.' read -r -a VERSION_PARTS <<< "$CURRENT_VERSION"
+        MAJOR="${VERSION_PARTS[0]}"
+        MINOR="${VERSION_PARTS[1]}"
+        PATCH="${VERSION_PARTS[2]}"
+
+        case "${{ steps.version_bump.outputs.bump_type }}" in
+          major)
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+            ;;
+          minor)
+            MINOR=$((MINOR + 1))
+            PATCH=0
+            ;;
+          patch)
+            PATCH=$((PATCH + 1))
+            ;;
+        esac
+
+        NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+        echo "New version: $NEW_VERSION"
+        echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+        # Update version in pyproject.toml
+        sed -i "s/^version = .*/version = \"$NEW_VERSION\"/" pyproject.toml
+
+        # Update version in __init__.py
+        sed -i "s/^__version__ = .*/__version__ = \"$NEW_VERSION\"/" src/a2a_approvals/__init__.py
+
+    - name: Update CHANGELOG
+      run: |
+        VERSION="${{ steps.bump_version.outputs.new_version }}"
+        DATE=$(date +%Y-%m-%d)
+
+        if [ ! -f CHANGELOG.md ]; then
+          echo "# Changelog" > CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          echo "All notable changes to this project will be documented in this file." >> CHANGELOG.md
+          echo "" >> CHANGELOG.md
+        fi
+
+        # Create temporary file with new entry
+        {
+          head -n 3 CHANGELOG.md
+          echo ""
+          echo "## [$VERSION] - $DATE"
+          echo ""
+          echo "### Changed"
+          echo ""
+          git log --pretty=format:"- %s" $(git describe --tags --abbrev=0 2>/dev/null || git rev-list --max-parents=0 HEAD)..HEAD
+          echo ""
+          echo ""
+          tail -n +4 CHANGELOG.md
+        } > CHANGELOG.md.tmp
+
+        mv CHANGELOG.md.tmp CHANGELOG.md
+
+    - name: Commit version bump
+      run: |
+        git add pyproject.toml src/a2a_approvals/__init__.py CHANGELOG.md
+        git commit -m "chore: bump version to ${{ steps.bump_version.outputs.new_version }}"
+        git tag -a "v${{ steps.bump_version.outputs.new_version }}" -m "Release v${{ steps.bump_version.outputs.new_version }}"
+
+    - name: Push changes
+      run: |
+        git push origin main
+        git push origin "v${{ steps.bump_version.outputs.new_version }}"
+
+    - name: Build package
+      run: uv build
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v${{ steps.bump_version.outputs.new_version }}
+        name: Release v${{ steps.bump_version.outputs.new_version }}
+        body_path: CHANGELOG.md
+        files: |
+          dist/*
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
